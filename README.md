@@ -105,7 +105,6 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/pretrain.py \
 
 Tips:
 - `.hf_token` is used automatically if you specify gated LMs.
-- If you see tokenizer handling errors for certain LMs, check `README_RYLAN.md` for current status/workarounds.
 
 ---
 
@@ -145,7 +144,6 @@ print(text)
 - `scripts/` – dataset processing, training, generation; includes `webvid.py` helpers for video data
 - `experiment_scripts/` – shell scripts for various controlled experiments
 - `run_pretrain.sh` – example launcher for a simple video pretraining run
-- `README_RYLAN.md` – additional notes, small-run examples, and known tokenizer statuses
 
 ---
 
