@@ -36,6 +36,7 @@ class VLM(nn.Module, GenerationMixin, ABC):
         vision_backbone: VisionBackbone,
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
+        **kwargs
     ) -> None:
         super().__init__()
         self.model_family, self.model_id = model_family, model_id

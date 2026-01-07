@@ -75,6 +75,7 @@ class ModelConfig(ChoiceRegistry):
     num_frames: int = 8                                     # Number of frames as input to VideoCLIP-VIT (use this flag for training on videos!)
     init_from_model: str = None                             # (prismatic) checkpoint to load (specify by model_id -> for e.g., prism-clip+7b) 
     repo_id: str = None                                     # which hf repo to download the pretrained checkpoint from? (one of "RylanSchaeffer/prismatic-vlms", "TRI-ML/prismatic-vlms")
+    ckpt_interval: int = None                               # Number of steps between checkpoints (default: None, save every epoch)
     # fmt: on
 
 

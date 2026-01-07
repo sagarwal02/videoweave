@@ -183,7 +183,8 @@ class Metrics:
         # Note :: Raw Loss is an Average over Gradient Accumulation Steps --> No Smoothing!
         loss_raw = torch.stack(list(self.state["loss_raw"])).mean().item()
         loss = torch.stack(list(self.state["loss"])).mean().item()
-        step_time, lr = np.mean(list(self.state["step_time"])), self.state["lr"][-1]
+        step_time = np.mean(list(self.state["step_time"]))
+        lr = self.state["lr"][-1] if len(self.state["lr"]) > 0 else 0
         status = self.get_status(loss)
 
         # Fire to Trackers

@@ -34,6 +34,8 @@ from prismatic.models.vlms import PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.training.strategies.base_strategy import TrainingStrategy
 
+import schedulefree
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -59,6 +61,7 @@ class FSDPStrategy(TrainingStrategy):
         worker_init_fn: Optional[Callable[[int], None]] = None,
         sharding_strategy: str = "shard-grad-op",
         state_dict_type: StateDictType = StateDictType.FULL_STATE_DICT,
+        dry_run: bool = False,
     ) -> None:
         super().__init__(
             vlm=vlm,
@@ -77,6 +80,7 @@ class FSDPStrategy(TrainingStrategy):
             reduce_in_full_precision=reduce_in_full_precision,
             mixed_precision_dtype=mixed_precision_dtype,
             worker_init_fn=worker_init_fn,
+            dry_run=dry_run,
         )
 
         # FSDP-Specific Parameters
@@ -98,6 +102,7 @@ class FSDPStrategy(TrainingStrategy):
         epoch: int,
         train_loss: Optional[float] = None,
         only_trainable: bool = True,
+        use_idx: bool = False,
     ) -> None:
         """Save a checkpoint to the `run_dir` only containing the state_dicts for trainable parameters by default."""
         assert isinstance(self.vlm, FSDP), "FSDPStrategy.save_checkpoint assumes VLM is already wrapped in FSDP!"
@@ -119,7 +124,9 @@ class FSDPStrategy(TrainingStrategy):
             # Save on rank zero *only*
             if overwatch.is_rank_zero():
                 checkpoint_dir = run_dir / "checkpoints"
-                if train_loss is None:
+                if use_idx:
+                    checkpoint_path = checkpoint_dir / f"step-{epoch:10d}-iters.pt"
+                elif train_loss is None:
                     checkpoint_path = checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}-loss=inf.pt"
                 else:
                     checkpoint_path = (
@@ -190,7 +197,7 @@ class FSDPStrategy(TrainingStrategy):
 
         # Create Optimizer and LR Scheduler =>> note that most of the LR Schedulers we use require `max_steps/epochs`
         #   => Optimizer should only operate on parameters that are *unfrozen* / trainable!
-        if self.lr_scheduler_type == "linear-warmup+cosine-decay":
+        if self.lr_scheduler_type == "linear-warmup+cosine-decay" or self.lr_scheduler_type == "schedule_free_adamw":
             n_train_examples = math.ceil(n_train_examples / self.global_batch_size) * self.global_batch_size
             if self.max_steps is None:
                 num_training_steps = (n_train_examples * self.epochs) // self.global_batch_size
@@ -215,10 +222,16 @@ class FSDPStrategy(TrainingStrategy):
 
             # Build Parameter Groups
             groups = [{"params": decay, "weight_decay": self.weight_decay}, {"params": no_decay, "weight_decay": 0.0}]
+            
+            if self.lr_scheduler_type == "schedule_free_adamw":
+                self.optimizer = schedulefree.AdamWScheduleFree(groups, lr=self.learning_rate)
+                self.lr_scheduler = self.lr_scheduler_type
 
-            # Create Optimizer & LR Scheduler
-            self.optimizer = AdamW(groups, lr=self.learning_rate)
-            self.lr_scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps, num_training_steps)
+            else:
+                # Create Optimizer & LR Scheduler
+                self.optimizer = AdamW(groups, lr=self.learning_rate)
+                self.lr_scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps, num_training_steps)
+            
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = 0.0
 

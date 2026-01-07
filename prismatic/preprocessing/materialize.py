@@ -55,6 +55,8 @@ def get_dataset_and_collator(
                     image_transform,
                     tokenizer,
                     prompt_builder_fn=prompt_builder_fn,
+                    eval_interval=dataset_cfg.eval_interval,
+                    lmms_eval_list=dataset_cfg.lmms_eval_list,
                 )
                 datasets.append(dataset)
         else:
@@ -64,6 +66,8 @@ def get_dataset_and_collator(
                 image_transform,
                 tokenizer,
                 prompt_builder_fn=prompt_builder_fn,
+                eval_interval=dataset_cfg.eval_interval,
+                lmms_eval_list=dataset_cfg.lmms_eval_list,
             )
         return datasets, collator
 

@@ -24,6 +24,7 @@ from transformers import CodeGenTokenizerFast, GemmaTokenizerFast, LlamaTokenize
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 import random 
+import decord
 
 # HuggingFace Default / Llama-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
@@ -141,7 +142,7 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         """Get a list of modalities (unimodal / text-only vs. multimodal) and length of conversations per example."""
         modality_lengths = []
         for example in self.examples:
-            is_multimodal = "image" in example or "frames" in example
+            is_multimodal = "image" in example or "frames" in example or "videos" in example
             n_words = sum([len(turn["value"].replace("<image>", "").split()) for turn in example["conversations"]])
             modality_lengths.append((is_multimodal, (n_image_patches + n_words) if is_multimodal else n_words))
         return modality_lengths
@@ -159,6 +160,8 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         tokenizer: PreTrainedTokenizerBase,
         prompt_builder_fn: Type[PromptBuilder],
         shuffle_frames: bool = False,
+        eval_interval: int = None,
+        lmms_eval_list: List[str] = None,
     ) -> None:
         super().__init__()
         self.instruct_json, self.image_dir = instruct_json, image_dir
@@ -166,7 +169,9 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         self.prompt_builder_fn = prompt_builder_fn
         self.dataset_type = "finetune"
         self.shuffle_frames = shuffle_frames
-
+        self.eval_interval = eval_interval
+        self.lmms_eval_list = lmms_eval_list
+        
         if self.shuffle_frames:
             print("Shuffling frame order for finetune dataset!")
 
@@ -262,7 +267,7 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
 
             return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
         # === Handle multi-image (video) inputs ===
-        if "frames" in self.examples[idx]:
+        elif "frames" in self.examples[idx]:
             image_paths = [Path(image_path) for image_path in self.examples[idx]["frames"]]
 
             if self.shuffle_frames:
@@ -288,6 +293,46 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
             
             return dict(pixel_values=input_data, input_ids=input_ids, labels=labels)
 
+        elif "videos" in self.examples[idx]:
+            try:
+                frames_per_video = self.examples[idx]["num_frames_per_video"]
+            except KeyError:
+                print("Should specify frames per video in the example! Otherwise defaulting to 16.")
+                frames_per_video = 16
+
+            video_paths = [Path(video_path) for video_path in self.examples[idx]["videos"]]
+
+            if self.shuffle_frames:
+                random.shuffle(video_paths)
+
+            # Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches right after)
+            labels[0] = IGNORE_INDEX
+
+            # Number of frames per video to sample using decord and transform with self.image_transform
+            # Use decord to sample 'frames_per_video' frames from each video uniformly randomly during training. Ensure order is preserved.
+            # If the video is shorter than 'frames_per_video', sample all frames and repeat final frame if necessary.
+
+            input_frames = []
+
+            for video_path in video_paths:
+                # Load video with decord to find length, sample frames from 0 to length - 1 uniformly, sort and get RGB vals
+                try:
+                    video_reader = decord.VideoReader(str(video_path))
+                    num_total_frames = len(video_reader)
+                    frame_indices = np.random.choice(num_total_frames, size=frames_per_video, replace=False)
+                    if not self.shuffle_frames: 
+                        frame_indices = np.sort(frame_indices)
+                    decord_vals = video_reader.get_batch(frame_indices).asnumpy()
+                except Exception as e:
+                    print("Error loading video:", str(video_path), ":", e)
+                    decord_vals = np.zeros((frames_per_video, 224, 224, 3), dtype=np.uint8) # default to black image if cannot load video
+                frames = [self.image_transform(Image.fromarray(decord_val)) for decord_val in decord_vals]
+                input_frames.extend(frames)
+
+            input_data = torch.stack(input_frames).to(input_frames[0].device)
+                        
+            return dict(pixel_values=input_data, input_ids=input_ids, labels=labels)
+
         else:
             # No image --> return `pixel_values` = None; Collator will do the smart batch handling for us!
             return dict(pixel_values=None, input_ids=input_ids, labels=labels)
@@ -296,7 +341,7 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         """Get a list of modalities (unimodal / text-only vs. multimodal) and length of conversations per example."""
         modality_lengths = []
         for example in self.examples:
-            is_multimodal = "image" in example or "frames" in example
+            is_multimodal = "image" in example or "frames" in example or "videos" in example
             n_words = sum([len(turn["value"].split()) for turn in example["conversations"]])
             modality_lengths.append((is_multimodal, n_words))
         return modality_lengths

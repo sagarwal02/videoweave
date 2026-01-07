@@ -71,8 +71,13 @@ class LlamaLLMBackbone(HFCausalLLMBackbone):
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
         use_flash_attention_2: bool = True,
-        rope_kwargs: Optional[Dict] = None
+        rope_kwargs: Optional[Dict] = None,
+        **kwargs
     ) -> None:
+        if "attn_implementation" in kwargs:
+            print(f"using attn_implementation: {kwargs['attn_implementation']}")
+            use_flash_attention_2 = kwargs['attn_implementation'] == "flash_attention_2"
+
         super().__init__(
             llm_backbone_id,
             llm_max_length=llm_max_length,
@@ -81,6 +86,7 @@ class LlamaLLMBackbone(HFCausalLLMBackbone):
             use_flash_attention_2=use_flash_attention_2,
             rope_kwargs=rope_kwargs,
             **LLAMA2_MODELS[llm_backbone_id],
+            **kwargs
         )
 
         # [Special Case] Llama-2 PAD Token Handling --> for clarity, we add an extra token (and resize)

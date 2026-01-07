@@ -27,10 +27,16 @@ from prismatic.util.data_utils import PaddedCollatorForLanguageModeling
 from prismatic.preprocessing.datasets.datasets import convert_to_prismatic_format
 import json
 import wandb
+import subprocess
+import datetime
+import time
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
+def set_trace():
+    if dist.get_rank() == 0:
+        import pdb; pdb.set_trace()
 
 # === Abstract Base Class for an arbitrary Training Strategy ===
 class TrainingStrategy(ABC):
@@ -52,6 +58,7 @@ class TrainingStrategy(ABC):
         reduce_in_full_precision: bool = False,
         mixed_precision_dtype: torch.dtype = torch.bfloat16,
         worker_init_fn: Optional[Callable[[int], None]] = None,
+        dry_run: bool = False,
         **_: str,
     ) -> None:
         self.vlm, self.device_id = vlm, device_id
@@ -79,6 +86,8 @@ class TrainingStrategy(ABC):
         # Optimizers & Scheduler (initialized in `run_setup`)
         self.optimizer, self.lr_scheduler = None, None
 
+        self.dry_run = dry_run
+
         # Lightweight Validation
         assert (
             self.global_batch_size % self.per_device_batch_size == 0
@@ -96,6 +105,7 @@ class TrainingStrategy(ABC):
         epoch: int,
         train_loss: Optional[float] = None,
         only_trainable: bool = True,
+        use_idx: bool = False,
     ) -> None: ...
 
     @abstractmethod
@@ -245,6 +255,8 @@ class TrainingStrategy(ABC):
         ) as progress:
             for epoch in range(self.epochs):
                 self.vlm.train()
+                if "schedule_free" in self.lr_scheduler_type:
+                    self.optimizer.train()
                 if isinstance(dataset, list):
                     sampler[epoch].set_epoch(epoch)
                     dloader = dataloader[epoch]
@@ -253,7 +265,8 @@ class TrainingStrategy(ABC):
                     dloader = dataloader
 
                 # Zero-Gradients (just in case)
-                self.optimizer.zero_grad()
+                if "schedule_free" not in self.lr_scheduler_type:
+                    self.optimizer.zero_grad()
 
                 # Note that we'll unpack batch (and let AMP/FSDP do its thing) in the VLM.forward() call
                 #   => Basically, if we're using mixed precision (or not), autocast()/FSDP will move to device!
@@ -300,11 +313,14 @@ class TrainingStrategy(ABC):
 
                         # Optimizer & LR Scheduler Step
                         self.optimizer.step()
-                        self.lr_scheduler.step()
-                        self.optimizer.zero_grad()
+                        if "schedule_free" not in self.lr_scheduler_type:
+                            self.lr_scheduler.step()
+                            self.optimizer.zero_grad()
 
                         # Push Metrics
-                        metrics.commit(global_step=metrics.global_step + 1, lr=self.lr_scheduler.get_last_lr()[0])
+                        if "schedule_free" not in self.lr_scheduler_type:
+                            metrics.commit(lr=self.lr_scheduler.get_last_lr()[0])
+                        metrics.commit(global_step=metrics.global_step + 1)
                         status = metrics.push()
 
                         # Check for Termination & Save Final Checkpoint (in case `max_steps` is not None)
@@ -315,36 +331,29 @@ class TrainingStrategy(ABC):
                             return
 
                         # Update Progress Bar
+                    
                         progress.update()
                         progress.set_description(status)
 
-                # Do validation
-                if val_dataset is not None:
-                    self.vlm.eval()
-                    val_losses = []
-                    #import pdb; pdb.set_trace()
-                    overwatch.info("Validating model..")
-                    for val_idx, batch in tqdm(enumerate(val_dataloader), total=len(val_dataloader)):
-                        with torch.no_grad():
-                            with torch.autocast(
-                                "cuda",
-                                dtype=self.mixed_precision_dtype,
-                                enabled=self.enable_mixed_precision_training,
-                            ):
-                                output: CausalLMOutputWithPast = self.vlm(
-                                    input_ids=batch["input_ids"],
-                                    attention_mask=batch["attention_mask"],
-                                    pixel_values=batch["pixel_values"],
-                                    labels=batch["labels"],
-                                    multimodal_indices=batch["multimodal_indices"],
-                                )
-                                loss = output.loss
-                                val_losses.append(loss.item())
-                    
-                    if overwatch.is_rank_zero():
-                        overwatch.info(f'Validation loss: {sum(val_losses) / len(val_losses)}')
-                        wandb.log({"val_loss": sum(val_losses) / len(val_losses)})
-                    
+                        #set_trace() 
+
+                        # Save checkpoint every ckpt_interval steps
+                        if hasattr(self.vlm, 'ckpt_interval') and self.vlm.ckpt_interval is not None:
+                            if (train_idx + 1) % self.vlm.ckpt_interval == 0:
+                                dist.barrier()
+                                overwatch.info(f'Saving checkpoint.. step = {metrics.global_step}, loss = {loss.item()}')
+                                if "schedule_free" in self.lr_scheduler_type:
+                                    self.vlm.eval()
+                                    self.optimizer.eval()
+
+                                self.save_checkpoint(metrics.run_dir, metrics.global_step, train_idx + 1, None, use_idx=True)
+                                if "schedule_free" in self.lr_scheduler_type:
+                                    self.vlm.train()
+                                    self.optimizer.train()
+                        
+                # Do eval at end of each epoch if `eval_interval` is not set
+                if not hasattr(val_dataset, 'eval_interval') or val_dataset.eval_interval is None:
+                    self.do_validation(val_dataset, val_dataloader)
                 
                 # Save checkpoint at end of each epoch (if `self.max_steps` is None)
                 if self.max_steps is None: # and overwatch.is_rank_zero()
@@ -354,3 +363,125 @@ class TrainingStrategy(ABC):
 
             # at the end of all epochs.
             # dist.barrier()
+    def do_validation(self, val_dataset, val_dataloader):
+        return # Just skip this for now
+        # Check if current vlm state is train or eval
+        orginally_train = self.vlm.training
+        self.vlm.eval()
+        if val_dataset is not None:
+            # TODO: [Zane] Implement evals during training to make plots easier. Right now, timeout error due to using 1 GPU only I think
+            #if val_dataset.lmms_eval_list is not None:
+            #    self.do_lmms_eval(lmms_eval_list=val_dataset.lmms_eval_list)
+
+            self.vlm.eval()
+            val_losses = []
+            #import pdb; pdb.set_trace()
+            overwatch.info("Validating model..")
+            for val_idx, batch in tqdm(enumerate(val_dataloader), total=len(val_dataloader)):
+                with torch.no_grad():
+                    with torch.autocast(
+                        "cuda",
+                        dtype=self.mixed_precision_dtype,
+                        enabled=self.enable_mixed_precision_training,
+                    ):
+                        output: CausalLMOutputWithPast = self.vlm(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            pixel_values=batch["pixel_values"],
+                            labels=batch["labels"],
+                            multimodal_indices=batch["multimodal_indices"],
+                        )
+                        loss = output.loss
+                        val_losses.append(loss.item())
+            
+            if overwatch.is_rank_zero():
+                overwatch.info(f'Validation loss: {sum(val_losses) / len(val_losses)}')
+                wandb.log({"val_loss": sum(val_losses) / len(val_losses)})
+        if orginally_train:
+            self.vlm.train()
+    
+    def do_lmms_eval(self, lmms_eval_list):
+        print('Running lmms_eval_list = ', lmms_eval_list)
+
+        # Run evaluation
+        self.vlm.eval()
+
+        # Run eval on single GPU only, set other GPUs to wait for completion
+        if dist.get_rank() == 0:
+            verbosity = "INFO"
+            import lmms_eval
+            from lmms_eval import evaluator
+            from lmms_eval.tasks import TaskManager, get_task_dict
+            import os
+
+            # Login to huggingface using token if not already logged in
+            hf_token_path = ".hf_token"
+            if not os.path.exists(hf_token_path):
+                raise ValueError(f"HF token not found at {hf_token_path}")
+            with open(hf_token_path, "r") as f:
+                hf_token = f.read().strip()
+            if hf_token:
+                os.environ["HF_TOKEN"] = hf_token
+
+            task_manager = TaskManager(verbosity, model_name="prismatic")
+            task_dict = get_task_dict(lmms_eval_list, task_manager)
+            lm = lmms_eval.models.get_model("prismatic").create_from_arg_string(
+                "",
+                {
+                    "batch_size": 1,
+                    "max_batch_size": 1,
+                    "device": "cuda:0",
+                    "model_object": self.vlm,
+                }
+            )
+
+            def _adjust_config(task_dict):
+                adjusted_task_dict = {}
+                for task_name, task_obj in task_dict.items():
+                    if isinstance(task_obj, dict):
+                        adjusted_task_dict = {
+                            **adjusted_task_dict,
+                            **{task_name: _adjust_config(task_obj)},
+                        }
+
+                    else:
+                        task_obj = task_dict[task_name]
+                        if type(task_obj) == tuple:
+                            group, task_obj = task_obj
+                            if task_obj is None:
+                                continue
+                        lm.task_dict[task_name] = task_obj.dataset
+
+
+                        task_obj.set_config(key="num_fewshot", value=0)
+                        # fewshot_random_seed set for tasks, even with a default num_fewshot (e.g. in the YAML file)
+                        task_obj.set_fewshot_seed(seed=1234)
+                        # eval_logger.info(f"Setting fewshot random generator seed to {fewshot_random_seed}")
+
+                        adjusted_task_dict[task_name] = task_obj
+
+                return adjusted_task_dict
+
+            task_dict = _adjust_config(task_dict)
+
+            results = evaluator.evaluate(
+                lm=lm,
+                task_dict=task_dict,
+                limit=None,
+                cache_requests=False,
+                rewrite_requests_cache=False,
+                bootstrap_iters=100000,
+                write_out=False,
+                log_samples=True,
+                system_instruction=None,
+                apply_chat_template=False,
+                fewshot_as_multiturn=False,
+                verbosity=verbosity,
+                cli_args=None,
+            )
+            print("results = ", results)
+
+        # Other GPUs wait for completion. Hacky code since monitored_barrier is not implemented for NCCL backend and overwatch initializes the process group.
+        dist.barrier()
+
+          

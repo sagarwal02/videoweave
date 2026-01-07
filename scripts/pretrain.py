@@ -21,6 +21,13 @@ Run with:
     - [Multi-Node/AWS Sagemaker] Depends on your individual setup; file an issue if you have trouble!
 """
 
+import torch.distributed as dist
+import datetime
+import os
+# Set NCCL_TIMEOUT to 24 hours (in seconds) to allow for extensive evals during training.
+#dist.init_process_group(backend="nccl",timeout=datetime.timedelta(hours=24)) # 24 hour timeout to allow for extensive evals during training
+
+
 import json
 import os
 from dataclasses import dataclass, field
@@ -29,9 +36,8 @@ from typing import Optional, Tuple, Union
 
 import draccus
 import torch
-import torch.distributed as dist
 import yaml
-
+from tqdm import tqdm
 from prismatic.conf import DatasetConfig, DatasetRegistry, ModelConfig, ModelRegistry
 from prismatic.models import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform, get_vlm
 from prismatic.overwatch import initialize_overwatch
@@ -42,8 +48,19 @@ from prismatic.util import set_global_seed
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
+# FSDP imports for dry run
+from torch.distributed.fsdp import (
+    FullStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -156,7 +173,8 @@ def pretrain(cfg: PretrainConfig) -> None:
     # Create Unique Run Name & Save Directory
     model_id = cfg.model.model_id
     # import pdb; pdb.set_trace()
-    
+    overwatch.info(f"Running seed: {cfg.seed}")    
+
     if (dataset_id := cfg.dataset.dataset_id) == "llava-v15":
         cfg.run_id = f"{model_id}+stage-{cfg.stage}+x{cfg.seed}" if cfg.run_id is None else cfg.run_id
     else:
@@ -185,8 +203,14 @@ def pretrain(cfg: PretrainConfig) -> None:
 
     # Load LLM Backbone --> on CPU, in Full Precision (initializing Tokenizer + handling special tokens if necessary)
     overwatch.info(f"Loading Pretrained LLM [bold]{cfg.model.llm_backbone_id}[/] via HF Transformers")
+    if cfg.dry_run:
+        model_kwargs = {
+           "attn_implementation": "eager"
+        }
+    else:
+        model_kwargs = {}
     llm_backbone, tokenizer = get_llm_backbone_and_tokenizer(
-        cfg.model.llm_backbone_id, llm_max_length=cfg.model.llm_max_length, hf_token=hf_token, rope_kwargs=cfg.rope_kwargs
+        cfg.model.llm_backbone_id, llm_max_length=cfg.model.llm_max_length, hf_token=hf_token, rope_kwargs=cfg.rope_kwargs, **model_kwargs 
     )
 
     # Create VLM => wraps `vision_backbone` and `llm`
@@ -200,6 +224,7 @@ def pretrain(cfg: PretrainConfig) -> None:
         vision_backbone,
         llm_backbone,
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
+        ckpt_interval=cfg.model.ckpt_interval
     )
 
     if cfg.checkpoint_pt is not None:
@@ -219,27 +244,6 @@ def pretrain(cfg: PretrainConfig) -> None:
     # print(vlm.vision_backbone.dtype)  -> torch.bfloat16
     # import pdb; pdb.set_trace()
 
-    # [DRY RUN] testing first pass of the model with video inputs.
-    if cfg.dry_run:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        vlm.to(device, dtype=torch.bfloat16)
-        vlm.eval()
-        image = []
-        for i in range(8):
-            filepath = f"./10006322/{str(i).zfill(4)}.png"
-            image.append(Image.open(filepath).convert("RGB"))
-        # prompt_text = "<image>\nDescribe what is happening in the video."
-        prompt_text = "Input: What is going on in the image?\nOutput: "  # Input: <prompt>\nOutput:
-        image = image + image
-        generated_text = vlm.generate(
-                            image[:4],
-                            prompt_text,
-                            do_sample=False,
-                            temperature=1.0,
-                            max_new_tokens=512,
-                            min_length=1
-                        )
-        import pdb; pdb.set_trace()
 
     # [Explicit] Call to `freeze_backbones` here for clarity => will log exactly what is frozen / what's not!
     overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{model_id}` => Training Stage: `{cfg.stage}`")
@@ -290,6 +294,7 @@ def pretrain(cfg: PretrainConfig) -> None:
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
         reduce_in_full_precision=cfg.model.reduce_in_full_precision,
         worker_init_fn=worker_init_fn,
+        dry_run=cfg.dry_run if cfg.dry_run else False,
     )
     if isinstance(train_dataset, list):
         train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset[0]))
@@ -317,6 +322,73 @@ def pretrain(cfg: PretrainConfig) -> None:
             module.to(torch.bfloat16)
         except Exception as e:
             pass
+
+    
+    # [DRY RUN] testing first pass of the model with video inputs.
+    # Visualize attention weights and save it to a file
+    if cfg.dry_run:
+        # MixedPrecision `param_dtype` specifies *compute* dtype (for forward/backward only)
+        #   => Reference: https://pytorch.org/docs/stable/fsdp.html#torch.distributed.fsdp.MixedPrecision
+        reduce_buffer_dtype = torch.bfloat16
+        fsdp_precision_policy = MixedPrecision(
+            param_dtype=torch.bfloat16, reduce_dtype=reduce_buffer_dtype, buffer_dtype=reduce_buffer_dtype
+        )
+
+        # When running FSDP with a frozen vision backbone --> move to half precision! ((https://github.com/TRI-ML/prismatic-vlms/issues/33))
+        overwatch.info("Casting Vision Backbone to *Half Precision* via `.to(dtype=...)`")
+        vlm.vision_backbone.to(dtype=vlm.vision_backbone.half_precision_dtype)
+
+        #vlm = FSDP(
+        #    vlm,
+        #    auto_wrap_policy=train_strategy.vlm.get_fsdp_wrapping_policy(),
+        #    mixed_precision=fsdp_precision_policy,
+        #    sharding_strategy=train_strategy.fsdp_sharding_strategy,
+        #    device_id=torch.cuda.current_device(),
+        #    limit_all_gathers=True,
+        #    use_orig_params=True,
+        #)
+
+        device_type = "cuda"
+        device = torch.device(device_type)
+        #vlm.to(device, dtype=torch.bfloat16)
+        vlm.eval()
+        image = []
+        for i in range(8):
+            filepath = f"./10006322/{str(i).zfill(4)}.png"
+            image.append(Image.open(filepath).convert("RGB"))
+        prompt_text = "What is occurring in the video?"
+        image = image + image  # 16 frames
+        # Prepare pixel_values as tensor batch
+        image_transform = vlm.vision_backbone.image_transform
+        pixel_values = [image_transform(img) for img in image]
+        pixel_values = torch.stack(pixel_values, dim=0).unsqueeze(0).to(device, dtype=torch.bfloat16)  # [1, T, 3, H, W]
+        print("Pixel values shape:", pixel_values.shape)
+        # Tokenize prompt
+        input_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(device)
+        max_new_tokens = 512
+        eos_token_id = tokenizer.eos_token_id
+        decoder_input_ids = input_ids
+        past_key_values = None
+        all_attentions = []
+        generated_tokens = []
+        autocast_dtype = vlm.llm_backbone.half_precision_dtype
+        with torch.inference_mode():
+            with torch.autocast(device_type, dtype=autocast_dtype, enabled=vlm.enable_mixed_precision_training):
+                outputs = vlm.generate(
+                    input_ids=decoder_input_ids,
+                    pixel_values=pixel_values,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_token_id,
+                    output_attentions=True,
+                    return_dict=True,
+                )
+                import pdb; pdb.set_trace()
+                print("outputs = ", outputs)
+        # Decode generated tokens (excluding prompt)
+        generated_text = tokenizer.decode(decoder_input_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+        print("Generated text:", generated_text)
+        # Optionally, save or process all_attentions here
+        exit() # End of dry run
 
     # Run Training
     overwatch.info("Starting Training Loop")

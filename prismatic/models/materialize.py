@@ -125,8 +125,11 @@ def get_llm_backbone_and_tokenizer(
     llm_max_length: int = 2048,
     hf_token: Optional[str] = None,
     inference_mode: bool = False,
-    rope_kwargs: Optional[Dict] = None
+    rope_kwargs: Optional[Dict] = None,
+    **kwargs
 ) -> Tuple[LLMBackbone, PreTrainedTokenizerBase]:
+
+    
     if llm_backbone_id in LLM_BACKBONES:
         llm_cfg = LLM_BACKBONES[llm_backbone_id]
         llm_backbone: LLMBackbone = llm_cfg["cls"](
@@ -135,7 +138,8 @@ def get_llm_backbone_and_tokenizer(
             hf_token=hf_token,
             inference_mode=inference_mode,
             rope_kwargs=rope_kwargs,
-            **llm_cfg["kwargs"]
+            **llm_cfg["kwargs"],
+            **kwargs
         )
         tokenizer = llm_backbone.get_tokenizer()
         return llm_backbone, tokenizer
@@ -150,6 +154,8 @@ def get_vlm(
     vision_backbone: VisionBackbone,
     llm_backbone: LLMBackbone,
     enable_mixed_precision_training: bool = True,
+    ckpt_interval: Optional[int] = None,
+    **kwargs
 ) -> PrismaticVLM:
     """Lightweight wrapper around initializing a VLM, mostly for future-proofing (if one wants to add a new VLM)."""
     return PrismaticVLM(
@@ -158,4 +164,6 @@ def get_vlm(
         llm_backbone,
         enable_mixed_precision_training=enable_mixed_precision_training,
         arch_specifier=arch_specifier,
+        ckpt_interval=ckpt_interval,
+        **kwargs
     )

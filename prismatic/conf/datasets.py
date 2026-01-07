@@ -27,6 +27,8 @@ class DatasetConfig(ChoiceRegistry):
     finetune_stage_components: Tuple[Path, Path]    # Path to annotation file and images directory for `finetune` stage
 
     dataset_root_dir: Path                          # Path to dataset root directory; others paths are relative to root
+    eval_interval: int = None                       # Number of steps between evaluations (default: None, eval every epoch instead)
+    lmms_eval_list: list[str] = None                # List of evals from lmms_eval to evaluate on
     # fmt: on
 
 

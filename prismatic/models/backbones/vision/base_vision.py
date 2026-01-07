@@ -188,7 +188,10 @@ class TimmViTBackbone(VisionBackbone, ABC):
 
     def forward(self, pixel_values: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """Runs transformed image/pixel tensor through vision backbone, returning _all_ patch features."""
-        return self.featurizer(pixel_values)
+        # Pixel values is either a tensor of shape (B, T, C, H, W) or (B, C, H, W) depending on if the input is a single frame video or an image.  We need to remove the time dimension in this case.
+        if pixel_values.ndim == 5:
+            pixel_values = pixel_values[:, 0, :, :, :]
+        return self.featurizer(pixel_values)  
 
     @property
     def default_image_resolution(self) -> Tuple[int, int, int]:
